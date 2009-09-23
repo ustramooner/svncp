@@ -1,0 +1,148 @@
+#!/usr/bin/env php
+<?php
+/**
+* This is a small php script I wrote to do versioned copies of files and folders between repositories
+* Read the usage output for more information
+* Author: Ben van Klinken
+* 
+*/
+
+//change this to blank if you want to copy externals
+$USEEXTERNALS='--ignore-externals';
+
+//change these values if you want to limit versions
+$from = 0;
+$to = 9999999999;
+
+//the temporary working directory
+$tmp='.svncp.tmp' . getmyuid() . '/';
+
+if (!function_exists('file_put_contents')) {
+	function file_put_contents($filename, $data) {
+		$f = @fopen($filename, 'w');
+		if (!$f) {
+			return false;
+		} else {
+			$bytes = fwrite($f, $data);
+			fclose($f);
+			return $bytes;
+		}
+	}
+}
+
+
+function usage() {
+echo "
+svncp: Duplicate a file from one repository to another repository.
+
+WARNING: BACKUP your data, as this program is experimental!!!
+This program works by removing your files and exporting versions into
+the DST folder. Everything in DST will be removed. It will also run
+svn commit on every version that SRC(s) have, so once you start there's
+no way back. It's probably worth trying to export to a test SVN checkout
+before doing this for real. You HAVE BEEN WARNED!
+
+usage: svncp SRC... DST
+
+When copying multiple sources, they will be added as children of DST,
+which must be a directory.
+
+  SRC and DST must be a working copy
+  SRC can be a file or a directory. If it is a directory, the children
+      are copied into the destination
+  DST must be a directory currently.
+
+";
+}
+
+if ( $argc < 2 ){
+	usage();
+	exit(-1);
+}
+
+echo "Checking input and output files...\n";
+
+$DST=$argv[$argc-1];
+if ( strpos(`svn info $DST` , 'Node Kind: directory') === false ||
+		strpos(`svn info $DST` , 'Revision: 0') !== false ){
+	die("$DST is not a valid svn directory or is not versioned");
+}
+if ( `svn stat $DST` != "" ){
+	die("$DST must be unmodified");
+}
+
+$files = array();
+for ( $i=1;$i<$argc-1;$i++ )
+	$files[] = $argv[$i];
+
+$files_str = "'" . implode("' '",$files) . "'";
+
+$revisions = array();
+foreach ( $files as $SRC ){
+	if ( strpos(`svn info $SRC` , 'Node Kind: file') === false && strpos(`svn info $SRC` , 'Node Kind: directory') === false ){
+		die("$SRC is not a valid svn file or directory");
+	}
+	$revsSummary = explode('------------------------------------------------------------------------', `svn log -q $SRC`);
+	$revs = array();
+	foreach ($revsSummary as $rev){
+		if ( !strlen($rev) ) continue;
+		$x = explode ('|', $rev);
+		if ( count($x) != 3 ) continue;
+		$rev = (int)substr(trim($x[0]),1);
+		if ( $rev >= $from && $rev <= $to )
+			$revs[] = $rev;
+	}
+	$revisions = array_merge($revisions, $revs);
+}
+$revisions = array_unique($revisions);
+sort($revisions);
+
+//process all the revisions
+foreach ( $revisions as $rev ){
+  echo "Processing revision $rev\n";
+  
+  //export this revision into our working directory
+  `rm -fdr $tmp`;
+  `svn export -r $rev $USEEXTERNALS $files_str $tmp`;
+  
+  //clear out the target... and copy the export into the destination
+  `find $DST -type f |grep -v '/.svn/'| xargs rm -f`;
+  `cp -a $tmp/* $DST`;
+  `rm -fdr $tmp`;
+  
+  //mark for adding and deleting
+  $ret = array(); exec("svn stat $DST", $ret);
+  foreach ( $ret as $stat ){
+    $cmd = substr($stat,0,1);
+    $file = trim(substr($stat,1));
+    if ( $cmd == '!' )
+    	`svn rm '$file'`;
+    elseif ($cmd == '?')
+    	`svn add '$file'`;
+    elseif ($cmd != 'M')
+      echo "Unknown file state: $stat\n";
+  }
+
+
+  //create a nice log file for committing
+  $x = `svn log -r $rev`;
+  $x = explode("\n", $x);
+  array_shift($x); //remove first line
+  $logDetails = array_shift($x); //get log dtails
+  array_shift($x); //remove first blank line
+  //remove last part of log
+  array_pop($x);array_pop($x);
+  $msg = trim(implode("\n", $x));
+  $fullmsg = "svncp: $logDetails \n $msg";
+
+	//commit this revision
+	$tmpfile = '.svncp.msg.' . getmyuid();
+	file_put_contents($tmpfile, $fullmsg);
+	echo `svn commit $DST -F $tmpfile`;
+	unlink($tmpfile);
+	$ret = array(); exec("svn status $DST", $ret, $val);
+	if ( count($ret) ){
+		echo "oh oh, something went wrong...\n";exit;
+	}
+}
+
